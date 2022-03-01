@@ -12,8 +12,10 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +24,11 @@ import (
 )
 
 const (
-	FolderKind  = "folder"
-	FileKind    = "file"
-	AnyKind     = "any"
-	MaxPartSize = 1024 * 1024 * 1024 // 1 GiB
+	FolderKind           = "folder"
+	FileKind             = "file"
+	AnyKind              = "any"
+	DefaultPartSize      = 100 * 1024 * 1024 // 100 MiB. Will store this size of data in memory per file for upload
+	DefaultUploadRetries = 10
 )
 
 const (
@@ -44,6 +47,7 @@ const (
 	apiTrash               = "https://api.aliyundrive.com/v2/recyclebin/trash"
 	apiDelete              = "https://api.aliyundrive.com/v3/file/delete"
 	apiBatch               = "https://api.aliyundrive.com/v2/batch"
+	apiRefreshUpload       = "https://api.aliyundrive.com/v2/file/get_upload_url"
 
 	fakeUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36"
 )
@@ -92,10 +96,13 @@ type Fs interface {
 }
 
 type Config struct {
-	RefreshToken   string
-	IsAlbum        bool
-	HttpClient     *http.Client
-	OnRefreshToken func(refreshToken string)
+	RefreshToken    string
+	IsAlbum         bool
+	HttpClient      *http.Client
+	UploadChunkSize int64
+	UploadRetries   int
+	OnRefreshToken  func(refreshToken string)
+	LogFunc         func(format string, a ...interface{})
 }
 
 func (config Config) String() string {
@@ -237,6 +244,15 @@ func (drive *Drive) jsonRequest(ctx context.Context, method, url string, request
 }
 
 func NewFs(ctx context.Context, config *Config) (Fs, error) {
+	if config.UploadChunkSize <= 0 {
+		config.UploadChunkSize = DefaultPartSize
+	}
+	if config.UploadRetries <= 0 {
+		config.UploadRetries = DefaultUploadRetries
+	}
+	if config.LogFunc == nil {
+		config.LogFunc = func(format string, a ...interface{}) {}
+	}
 	drive := &Drive{
 		config:     *config,
 		httpClient: config.HttpClient,
@@ -584,12 +600,12 @@ func (drive *Drive) CreateFile(ctx context.Context, node Node, in io.Reader) (st
 	return drive.CreateFileWithProof(ctx, node, in, sha1Code, proofCode)
 }
 
-func makePartInfoList(size int64) []*PartInfo {
+func makePartInfoList(size int64, partSize int64) []*PartInfo {
 	partInfoNum := 0
-	if size%MaxPartSize > 0 {
+	if size%partSize > 0 {
 		partInfoNum++
 	}
-	partInfoNum += int(size / MaxPartSize)
+	partInfoNum += int(size / partSize)
 	list := make([]*PartInfo, partInfoNum)
 	for i := 0; i < partInfoNum; i++ {
 		list[i] = &PartInfo{
@@ -597,6 +613,140 @@ func makePartInfoList(size int64) []*PartInfo {
 		}
 	}
 	return list
+}
+
+type CachedLimitReader struct {
+	buf     []byte
+	rd      io.Reader // reader provided by the client
+	w, r    int
+	length  int
+	logFunc func(format string, a ...interface{})
+	err     error
+}
+
+func NewCachedLimitReader(reader io.Reader, size int) *CachedLimitReader {
+	return &CachedLimitReader{
+		buf:    make([]byte, size),
+		rd:     io.LimitReader(reader, int64(size)),
+		w:      0,
+		r:      0,
+		length: size,
+		logFunc: func(format string, a ...interface{}) {
+			fmt.Printf(format, a...)
+		},
+	}
+}
+
+func NewCachedLimitReaderWithBuffer(reader io.Reader, buffer []byte, logFunc func(format string, a ...interface{})) *CachedLimitReader {
+	if len(buffer) == 0 {
+		panic("you can have an empty sized buffer")
+	}
+	size := len(buffer)
+	return &CachedLimitReader{
+		buf:     buffer,
+		rd:      io.LimitReader(reader, int64(size)),
+		w:       0,
+		r:       0,
+		length:  size,
+		logFunc: logFunc,
+	}
+}
+
+func min(a int, b int) int {
+	if a > b {
+		return b
+	}
+	return a
+}
+
+func minInt64(a int64, b int64) int64 {
+	if a > b {
+		return b
+	}
+	return a
+}
+
+func (r *CachedLimitReader) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	to_read := min(r.r+len(p), r.length) - r.w
+	read_n := 0
+	if to_read > 0 {
+		read_n, err = r.rd.Read(r.buf[r.w : r.w+to_read])
+	}
+	r.w += read_n
+	if err != nil {
+		r.logFunc("read err read_n:%d r:%d w:%d %v\n", read_n, r.r, r.w, err)
+	}
+	if to_read > 0 && err == io.EOF {
+		if r.length > r.w {
+			r.length = r.w
+		}
+	}
+	n = min(r.w-r.r, len(p))
+	if n == 0 {
+		if r.length == r.r {
+			err = io.EOF
+		} else {
+			r.logFunc("read unexpected no data r:%d w:%d, %v\n", r.r, r.w, err)
+		}
+		return
+	}
+	copy(p, r.buf[r.r:r.r+n])
+	r.r = r.r + n
+	if err != nil && err != io.EOF {
+		r.logFunc("read last err %v\n", err)
+		r.err = err
+	}
+	return
+}
+
+func (drive *Drive) refreshUploadUrl(ctx context.Context, uploadID string, fileID string, outParts []PartInfo) error {
+	partList := make([]*PartInfo, len(outParts))
+	for i := 0; i < len(outParts); i++ {
+		partList[i] = &PartInfo{
+			PartNumber: i + 1,
+		}
+	}
+	uploadInfo := UploadInfo{
+		DriveID:      drive.driveId,
+		PartInfoList: partList,
+		FileId:       fileID,
+		UploadId:     uploadID,
+	}
+	var uploadResult UploadResult
+	err := drive.jsonRequest(ctx, "POST", apiRefreshUpload, uploadInfo, &uploadResult)
+	if err != nil {
+		return err
+	}
+	if len(uploadResult.PartInfoList) != len(outParts) {
+		return errors.Errorf("refresh upload url invalid result length %d -> %d", len(outParts), len(uploadResult.PartInfoList))
+	}
+	for i, part := range uploadResult.PartInfoList {
+		outParts[i].UploadUrl = part.UploadUrl
+	}
+	return nil
+}
+
+func isUploadUrlValid(uploadUrl string) bool {
+	u, err := url.Parse(uploadUrl)
+	if err != nil {
+		return false
+	}
+	expireStr := u.Query().Get("x-oss-expires")
+	if len(expireStr) == 0 {
+		return true
+	}
+	expire, err := strconv.Atoi(expireStr)
+	if err != nil {
+		return false
+	}
+	timeStep := 60 * 10
+	return int(time.Now().Unix()) < expire-timeStep
 }
 
 func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Reader, sha1Code string, proofCode string) (string, error) {
@@ -612,7 +762,7 @@ func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Re
 
 	proof := &FileProof{
 		DriveID:         drive.driveId,
-		PartInfoList:    makePartInfoList(node.Size),
+		PartInfoList:    makePartInfoList(node.Size, drive.config.UploadChunkSize),
 		ParentFileID:    node.ParentId,
 		Name:            node.Name,
 		Type:            "file",
@@ -643,18 +793,60 @@ func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Re
 			return "", errors.New(`failed to extract uploadUrl`)
 		}
 	}
-
+	uploadBuffer := make([]byte, minInt64(drive.config.UploadChunkSize, node.Size))
+	uploadedSize := 0
+	drive.config.LogFunc("begin to upload %v, with ctx %v\n", node.Name, ctx)
 	for _, part := range proofResult.PartInfoList {
-		partReader := io.LimitReader(in, MaxPartSize)
-		req, err := http.NewRequestWithContext(ctx, "PUT", part.UploadUrl, partReader)
-		if err != nil {
-			return "", errors.Wrap(err, "failed to create upload request")
+		partSize := drive.config.UploadChunkSize
+		if part.PartNumber == len(proofResult.PartInfoList) {
+			partSize = node.Size % drive.config.UploadChunkSize
 		}
-		resp, err := drive.httpClient.Do(req)
-		if err != nil {
-			return "", errors.Wrap(err, "failed to upload file")
+		partReader := NewCachedLimitReaderWithBuffer(in, uploadBuffer, func(format string, a ...interface{}) {
+			f := fmt.Sprintf("%s %s", node.Name, format)
+			drive.config.LogFunc(f, a...)
+		})
+		tries := 0
+		for {
+			tries++
+			if partReader.err != nil {
+				return "", partReader.err
+			}
+			if !isUploadUrlValid(part.UploadUrl) {
+				drive.config.LogFunc("refreshing upload url for %d/%d %v, ", part.PartNumber, len(proofResult.PartInfoList), node.Name)
+				err := drive.refreshUploadUrl(ctx, proofResult.UploadId, proofResult.FileId, proofResult.PartInfoList)
+				if err != nil {
+					if tries < drive.config.UploadRetries && ctx.Err() == nil {
+						drive.config.LogFunc("refresh upload url failed %v, retry %d/%d, %v\n", part.UploadUrl, tries, drive.config.UploadRetries, err)
+						continue
+					} else {
+						return "", errors.Wrap(err, fmt.Sprintf("refresh upload url failed %v", err))
+					}
+				}
+				part = proofResult.PartInfoList[part.PartNumber-1]
+			}
+			partReader.r = 0
+			req, err := http.NewRequestWithContext(ctx, "PUT", part.UploadUrl, partReader)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to create upload request")
+			}
+			resp, err := drive.httpClient.Do(req)
+			if err != nil {
+				if tries < drive.config.UploadRetries && ctx.Err() == nil {
+					drive.config.LogFunc("failed to upload file part %d/%d of %v, end at %d/%d/%d/%d, retries %d/%d, %v\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, partReader.r, drive.config.UploadChunkSize, uploadedSize+partReader.r, node.Size, tries, drive.config.UploadRetries, err)
+					continue
+				} else {
+					return "", errors.Wrap(err, "failed to upload file")
+				}
+			}
+			resp.Body.Close()
+			if partReader.r < int(partSize) {
+				drive.config.LogFunc("upload part %d/%d of %v, not complete %d %d, ctx err %v\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, partReader.r, partSize, ctx.Err())
+				return "", errors.Wrap(err, "failed to upload file read not complete")
+			}
+			uploadedSize += partReader.r
+			drive.config.LogFunc("uploaded %d/%d of %v tries %d/%d size %d %d/%d %d percent\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, tries, drive.config.UploadRetries, partReader.r, uploadedSize, node.Size, uploadedSize*100/int(node.Size))
+			break
 		}
-		resp.Body.Close()
 	}
 
 	var result NodeId

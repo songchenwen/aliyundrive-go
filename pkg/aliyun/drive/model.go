@@ -107,3 +107,14 @@ type PersonalSpaceInfo struct {
 type PersonalInfo struct {
 	PersonalSpaceInfo PersonalSpaceInfo `json:"personal_space_info"`
 }
+
+type UploadInfo struct {
+	PartInfoList []*PartInfo `json:"part_info_list,omitempty"`
+	FileId       string      `json:"file_id"`
+	UploadId     string      `json:"upload_id"`
+	DriveID      string      `json:"drive_id"`
+}
+
+type UploadResult struct {
+	PartInfoList []*PartInfo `json:"part_info_list,omitempty"`
+}
