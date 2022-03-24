@@ -639,7 +639,7 @@ func NewCachedLimitReader(reader io.Reader, size int) *CachedLimitReader {
 
 func NewCachedLimitReaderWithBuffer(reader io.Reader, buffer []byte, logFunc func(format string, a ...interface{})) *CachedLimitReader {
 	if len(buffer) == 0 {
-		panic("you can have an empty sized buffer")
+		panic("you can't have an empty sized buffer")
 	}
 	size := len(buffer)
 	return &CachedLimitReader{
@@ -793,7 +793,11 @@ func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Re
 			return "", errors.New(`failed to extract uploadUrl`)
 		}
 	}
-	uploadBuffer := make([]byte, minInt64(drive.config.UploadChunkSize, node.Size))
+	bufferSize := minInt64(drive.config.UploadChunkSize, node.Size)
+	if bufferSize == 0 {
+		bufferSize = drive.config.UploadChunkSize
+	}
+	uploadBuffer := make([]byte, bufferSize)
 	uploadedSize := 0
 	drive.config.LogFunc("begin to upload %v, with ctx %v\n", node.Name, ctx)
 	for _, part := range proofResult.PartInfoList {
@@ -844,7 +848,11 @@ func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Re
 				return "", errors.Wrap(err, "failed to upload file read not complete")
 			}
 			uploadedSize += partReader.r
-			drive.config.LogFunc("uploaded %d/%d of %v tries %d/%d size %d %d/%d %d percent\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, tries, drive.config.UploadRetries, partReader.r, uploadedSize, node.Size, uploadedSize*100/int(node.Size))
+			percent := 100
+			if node.Size > 0 {
+				percent = uploadedSize * 100 / int(node.Size)
+			}
+			drive.config.LogFunc("uploaded %d/%d of %v tries %d/%d size %d %d/%d %d percent\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, tries, drive.config.UploadRetries, partReader.r, uploadedSize, node.Size, percent)
 			break
 		}
 	}
