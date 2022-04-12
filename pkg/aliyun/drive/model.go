@@ -70,6 +70,11 @@ type DownloadUrl struct {
 	Url        string            `json:"url"`
 }
 
+type DownloadUrlCacheItem struct {
+	DownloadUrl DownloadUrl `json:"download_url"`
+	ExpireTime  time.Time   `json:"expire_time"`
+}
+
 type FileProof struct {
 	DriveID         string      `json:"drive_id"`
 	PartInfoList    []*PartInfo `json:"part_info_list"`

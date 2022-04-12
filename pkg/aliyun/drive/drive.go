@@ -29,6 +29,7 @@ const (
 	AnyKind              = "any"
 	DefaultPartSize      = 100 * 1024 * 1024 // 100 MiB. Will store this size of data in memory per file for upload
 	DefaultUploadRetries = 10
+	DownloadUrlCacheSecs = 15*60 - 10
 )
 
 const (
@@ -111,12 +112,13 @@ func (config Config) String() string {
 
 type Drive struct {
 	token
-	config     Config
-	driveId    string
-	rootId     string
-	rootNode   Node
-	httpClient *http.Client
-	mutex      sync.Mutex
+	config           Config
+	driveId          string
+	rootId           string
+	rootNode         Node
+	httpClient       *http.Client
+	mutex            sync.Mutex
+	downloadUrlCache map[string]DownloadUrlCacheItem
 }
 
 type token struct {
@@ -287,6 +289,7 @@ func NewFs(ctx context.Context, config *Config) (Fs, error) {
 		Type:   "folder",
 		Name:   "root",
 	}
+	drive.downloadUrlCache = make(map[string]DownloadUrlCacheItem)
 
 	return drive, nil
 }
@@ -495,10 +498,32 @@ func (drive *Drive) getDownloadUrl(ctx context.Context, nodeId string) (*Downloa
 		"drive_id": drive.driveId,
 		"file_id":  nodeId,
 	}
+	if item, ok := drive.downloadUrlCache[nodeId]; ok {
+		if item.ExpireTime.After(time.Now()) {
+			drive.config.LogFunc("download url from cache of %s %s", nodeId, item.DownloadUrl.Url)
+			return &item.DownloadUrl, nil
+		}
+	}
 	err := drive.jsonRequest(ctx, "POST", "https://api.aliyundrive.com/v2/file/get_download_url", &data, &detail)
 	if err != nil {
 		return nil, errors.Wrapf(err, `failed to get node detail of "%s"`, nodeId)
 	}
+	expireTime := time.Now().Add(time.Duration(DownloadUrlCacheSecs) * time.Second)
+	u, err := url.Parse(detail.Url)
+	if err == nil {
+		expireStr := u.Query().Get("x-oss-expires")
+		if len(expireStr) > 0 {
+			expire, err := strconv.Atoi(expireStr)
+			if err == nil {
+				expireTime = time.Unix(int64(expire-10), 0)
+			}
+		}
+	}
+	drive.downloadUrlCache[nodeId] = DownloadUrlCacheItem{
+		DownloadUrl: detail,
+		ExpireTime:  expireTime,
+	}
+	drive.config.LogFunc("download url of %s %s, expires at %v", nodeId, detail.Url, expireTime)
 	return &detail, nil
 }
 
