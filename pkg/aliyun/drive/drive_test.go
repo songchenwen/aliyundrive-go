@@ -2,11 +2,12 @@ package drive
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,19 +16,13 @@ import (
 var fs Fs
 
 func setup(t *testing.T) context.Context {
-	token := ""
 	cb, err := ioutil.ReadFile("../../../.config")
-	if err == nil {
-		token = string(cb)
-	}
-	config := &Config{
-		RefreshToken: token,
-		IsAlbum:      false,
-		HttpClient:   &http.Client{},
-	}
-
+	require.NoError(t, err)
+	var config Config
+	err = json.Unmarshal(cb, &config)
+	require.NoError(t, err)
 	ctx := context.Background()
-	fs, err = NewFs(ctx, config)
+	fs, err = NewFs(ctx, &config)
 	require.NoError(t, err)
 	return ctx
 }
@@ -47,10 +42,39 @@ func TestIntegration(t *testing.T) {
 		info, err := fd.Stat()
 		require.NoError(t, err)
 		nodeId, err := fs.CreateFile(ctx, Node{Name: "rapid_upload.js", ParentId: childNodeId, Size: info.Size()}, fd)
+		defer fs.Remove(ctx, childNodeId)
 		require.NoError(t, err)
+		lNodes, err := fs.ListAll(ctx, childNodeId)
+		require.NoError(t, err)
+		fmt.Printf("ListAll result: %s\n", lNodes)
 		node, err := fs.Get(ctx, nodeId)
 		require.NoError(t, err)
 		fmt.Printf("node: %s\n", node)
+
+		shareID, sharePwd, expiration, err := fs.CreateShareLink(ctx, []Node{*node}, "1234", Hour*24)
+		require.NoError(t, err)
+		fmt.Printf("shareID: %s; sharePwd: %s; expire at: %s\n", shareID, sharePwd, expiration)
+		shareToken, err := fs.GetShareToken(ctx, sharePwd, shareID)
+		fmt.Printf("shareToken: %s", shareToken)
+		require.NoError(t, err)
+		_, _, _, fileID, err := fs.GetShareInfo(ctx, shareID)
+		require.NoError(t, err)
+		fmt.Println(fileID)
+		Expiration, Creator, err := fs.GetShareLinkByAnonymous(ctx, shareID)
+		require.NoError(t, err)
+		fmt.Printf("Expiration: %s; Creator: %s", Expiration, Creator)
+		time.Sleep(5 * time.Second)
+		SharedFile, nextMarker, err := fs.ListShareLinks(ctx)
+		require.NoError(t, err)
+		fmt.Printf("SharedFileList: %v; nextMarker: %s\n", SharedFile, nextMarker)
+		defer func() {
+			err := fs.CancelShareLink(ctx, shareID)
+			if err != nil {
+				panic(err)
+			}
+
+		}()
+
 		nodeId, err = fs.Move(ctx, nodeId, childNodeId, "rapid_upload.2.js")
 		require.NoError(t, err)
 		file, err := fs.Open(ctx, nodeId, map[string]string{})
@@ -77,23 +101,26 @@ func TestIntegration(t *testing.T) {
 }
 
 func TestSha1(t *testing.T) {
-	fd, err := os.Open("1.mp3")
+	fd, err := os.Open("../../../assets/rapid_upload.js")
 	require.NoError(t, err)
 	rd, s, err := CalcSha1(fd)
-	assert.Equal(t, "462FD5A7D4B12EE8A88CF0881D811BD224DB79FE", s)
+	assert.Equal(t, "3F4D82D88A0624EFD46D7A5FD06BE2D430C00301", s)
 	buf := make([]byte, 4)
 	_, _ = rd.Read(buf)
-	assert.Equal(t, []byte{0x49, 0x44, 0x33, 0x03}, buf)
+	assert.Equal(t, []byte{0x66, 0x75, 0x6e, 0x63}, buf)
 }
 
 func TestCalcProof(t *testing.T) {
-	fd, err := os.Open("1.mp3")
-	accessToken := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
-	fileSize := int64(4087117)
+	fd, err := os.Open("../../../assets/rapid_upload.js")
 	require.NoError(t, err)
-	rd, proofCode, err := calcProof(accessToken, fileSize, fd)
-	assert.Equal(t, "dj66UE3TEFM=", proofCode)
+	fi, err := fd.Stat()
+	require.NoError(t, err)
+	fileSize := fi.Size()
+	accessToken := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+	require.NoError(t, err)
+	proofCode, err := calcProof(accessToken, fileSize, fd)
+	assert.Equal(t, "Cn0KCmZ1bmM=", proofCode)
 	buf2 := make([]byte, 4)
-	_, _ = rd.Read(buf2)
-	assert.Equal(t, []byte{0x49, 0x44, 0x33, 0x03}, buf2)
+	_, _ = fd.Read(buf2)
+	assert.Equal(t, []byte{0x66, 0x75, 0x6e, 0x63}, buf2)
 }

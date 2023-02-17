@@ -18,13 +18,23 @@ see <https://github.com/K265/aliyundrive-go/blob/main/pkg/aliyun/drive/drive_tes
 
 - [x] album support
 
-## Thanks
+## Acknowledgements
 
 Thanks for your code contributions:
 
 [@SiHuan](https://github.com/sihuan)
 
 [@Jim Ma](https://github.com/jim3ma)
+
+[@STX5](https://github.com/STX5)
+
+Thanks for the rapid upload implementation:
+
+<https://github.com/alist-org/alist/blob/09564102e7ea4336ea6222e0381080a3a8273b21/drivers/aliyundrive/driver.go#L227>
+
+Thanks for the *X-Signature* fix:
+
+<https://github.com/foxxorcat/alist/blob/063f069157ff3d2be32ba29496a0d374743f9693/drivers/aliyundrive/util.go#L36>
 
 ## License
 

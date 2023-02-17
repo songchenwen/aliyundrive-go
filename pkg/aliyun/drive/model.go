@@ -48,8 +48,14 @@ type ListNodes struct {
 	NextMarker string `json:"next_marker"`
 }
 
+type ListSharedFile struct {
+	Items      []SharedFile `json:"items"`
+	NextMarker string       `json:"next_marker"`
+}
+
 type User struct {
 	DriveId string `json:"default_drive_id"`
+	UserId  string `json:"user_id"`
 }
 
 type AlbumInfo struct {
@@ -65,9 +71,25 @@ type Token struct {
 }
 
 type DownloadUrl struct {
-	Size       int64             `json:"size"`
-	StreamsUrl map[string]string `json:"streams_url,omitempty"`
-	Url        string            `json:"url"`
+	Size        int64             `json:"size"`
+	StreamsUrl  map[string]string `json:"streams_url,omitempty"`
+	Url         string            `json:"url"`
+	InternalUrl string            `json:"internal_url"`
+}
+
+type SharedFile struct {
+	DriveID    string   `json:"drive_id,omitempty"`
+	Pwd        string   `json:"share_pwd,omitempty"`
+	ShareID    string   `json:"share_id"`
+	Creator    string   `json:"creator,omitempty"`
+	ShareName  string   `json:"share_name,omitempty"`
+	Expiration string   `json:"expiration"`
+	FileIDList []string `json:"file_id_list,omitempty"`
+}
+type ShareToken struct {
+	exp        string `json:"expire_time"`
+	expIn      int64  `json:"expires_in"`
+	shareToken string `json:"share_token"`
 }
 
 type DownloadUrlCacheItem struct {
@@ -91,8 +113,9 @@ type FileProof struct {
 }
 
 type PartInfo struct {
-	PartNumber int    `json:"part_number"`
-	UploadUrl  string `json:"upload_url"`
+	PartNumber        int    `json:"part_number"`
+	UploadUrl         string `json:"upload_url"`
+	InternalUploadURL string `json:"internal_upload_url"`
 }
 
 type ProofResult struct {
@@ -122,4 +145,8 @@ type UploadInfo struct {
 
 type UploadResult struct {
 	PartInfoList []*PartInfo `json:"part_info_list,omitempty"`
+}
+
+type CreateDeviceSessionResult struct {
+	Success bool `json:"success"`
 }

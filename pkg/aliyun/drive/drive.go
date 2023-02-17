@@ -5,12 +5,19 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustinxie/ecc"
 	"github.com/pkg/errors"
 )
 
@@ -27,9 +35,10 @@ const (
 	FolderKind           = "folder"
 	FileKind             = "file"
 	AnyKind              = "any"
-	DefaultPartSize      = 100 * 1024 * 1024 // 100 MiB. Will store this size of data in memory per file for upload
 	DefaultUploadRetries = 10
 	DownloadUrlCacheSecs = 15*60 - 10
+	MaxPartSize          = 1024 * 1024 * 100 // 1 GiB
+	Hour                 = 60 * 60
 )
 
 const (
@@ -37,6 +46,7 @@ const (
 	apiPersonalInfo        = "https://api.aliyundrive.com/v2/databox/get_personal_info"
 	apiList                = "https://api.aliyundrive.com/v2/file/list"
 	apiCreate              = "https://api.aliyundrive.com/v2/file/create"
+	apiCreateDeviceSession = "https://api.aliyundrive.com/users/v1/users/device/create_session"
 	apiUpdate              = "https://api.aliyundrive.com/v2/file/update"
 	apiMove                = "https://api.aliyundrive.com/v2/file/move"
 	apiCopy                = "https://api.aliyundrive.com/v2/file/copy"
@@ -45,27 +55,40 @@ const (
 	apiGet                 = "https://api.aliyundrive.com/v2/file/get"
 	apiGetByPath           = "https://api.aliyundrive.com/v2/file/get_by_path"
 	apiCreateWithFolder    = "https://api.aliyundrive.com/adrive/v2/file/createWithFolders"
+	apiRenewDeviceSession  = "https://api.aliyundrive.com/users/v1/users/device/renew_session"
 	apiTrash               = "https://api.aliyundrive.com/v2/recyclebin/trash"
 	apiDelete              = "https://api.aliyundrive.com/v3/file/delete"
 	apiBatch               = "https://api.aliyundrive.com/v2/batch"
 	apiRefreshUpload       = "https://api.aliyundrive.com/v2/file/get_upload_url"
 
-	fakeUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36"
+	apiCreateShareLink         = "https://api.aliyundrive.com/v2/share_link/create"
+	apiGetShareLinkByShareID   = "https://api.aliyundrive.com/v2/share_link/get"
+	apiListShareLink           = "https://api.aliyundrive.com/v2/share_link/list"
+	apiGetShareToken           = "https://api.aliyundrive.com/v2/share_link/get_share_token"
+	apiCancelShareLink         = "https://api.aliyundrive.com/v2/share_link/cancel"
+	apiGetShareLinkByAnonymous = "https://api.aliyundrive.com/v2/share_link/get_by_anonymous"
+
+	fakeUA                     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36"
+	deviceSessionExpireSeconds = 300 // 5 min
 )
 
 var (
-	ErrorLivpUpload      = errors.New("uploading .livp to album is not supported")
-	ErrorTooManyRequests = errors.New("429 Too Many Requests")
-	ErrorNotFound        = errors.New("404 Not Found")
-	ErrorAlreadyExisted  = errors.New("already existed")
-	ErrorMissingFields   = errors.New("required fields: ParentId, Name")
+	ErrorLivpUpload     = errors.New("uploading .livp to album is not supported")
+	ErrorAlreadyExisted = errors.New("already existed")
+	ErrorMissingFields  = errors.New("required fields: ParentId, Name")
 )
+
+type Pager interface {
+	Next() bool
+	Nodes(ctx context.Context) ([]Node, error)
+}
 
 type Fs interface {
 	About(ctx context.Context) (*PersonalSpaceInfo, error)
 	Get(ctx context.Context, nodeId string) (*Node, error)
 	GetByPath(ctx context.Context, fullPath string, kind string) (*Node, error)
-	List(ctx context.Context, nodeId string) ([]Node, error)
+	List(nodeId string) Pager
+	ListAll(ctx context.Context, nodeId string) ([]Node, error)
 
 	// CreateFolder creates a folder to aliyun drive.
 	//
@@ -83,7 +106,7 @@ type Fs interface {
 	//
 	// may return ErrorMissingFields if required fields are missing.
 	CreateFile(ctx context.Context, node Node, in io.Reader) (nodeIdOut string, err error)
-	CalcProof(fileSize int64, in *os.File) (file *os.File, proof string, err error)
+	CalcProof(fileSize int64, in *os.File) (proof string, err error)
 
 	// CreateFileWithProof puts a file to aliyun drive.
 	//
@@ -94,16 +117,24 @@ type Fs interface {
 	Copy(ctx context.Context, nodeId string, dstParentNodeId string, dstName string) (nodeIdOut string, err error)
 	CreateFolderRecursively(ctx context.Context, fullPath string) (nodeIdOut string, err error)
 	Update(ctx context.Context, node Node) (nodeIdOut string, err error)
+
+	CreateShareLink(ctx context.Context, node []Node, pwd string, expiresIn int64) (ShareID string, SharePwd string, Expiration string, err error)
+	ListShareLinks(ctx context.Context) (items []SharedFile, nextMarker string, err error)
+	GetShareInfo(ctx context.Context, shareID string) (ShareID string, Pwd string, Expiration string, FileIDList []string, err error)
+	GetShareToken(ctx context.Context, pwd string, shareID string) (shareToken string, error error)
+	CancelShareLink(ctx context.Context, shareID string) error
+	GetShareLinkByAnonymous(ctx context.Context, shareID string) (Expiration string, Creator string, err error)
 }
 
 type Config struct {
-	RefreshToken    string
-	IsAlbum         bool
-	HttpClient      *http.Client
-	UploadChunkSize int64
-	UploadRetries   int
-	OnRefreshToken  func(refreshToken string)
-	LogFunc         func(format string, a ...interface{})
+	RefreshToken   string
+	DeviceId       string `json:"device_id"`
+	IsAlbum        bool
+	HttpClient     *http.Client
+	UploadRetries  int
+	OnRefreshToken func(refreshToken string)
+	UseInternalUrl bool `json:"use_internal_url,omitempty"`
+	LogFunc        func(format string, a ...interface{})
 }
 
 func (config Config) String() string {
@@ -112,6 +143,7 @@ func (config Config) String() string {
 
 type Drive struct {
 	token
+	deviceSession
 	config           Config
 	driveId          string
 	rootId           string
@@ -126,8 +158,83 @@ type token struct {
 	expireAt    int64
 }
 
+type deviceSession struct {
+	userId                  string
+	deviceSessionExpireAt   int64
+	deviceSessionPrivateKey *ecdsa.PrivateKey
+	nonce                   int
+	signature               string
+	deviceSessionMutex      sync.Mutex
+}
+
+type HTTPStatusError interface {
+	error
+	StatusCode() int
+}
+
+type httpStatusError struct {
+	message    string
+	statusCode int
+}
+
+type pager struct {
+	drive  *Drive
+	param  map[string]interface{}
+	lNodes *ListNodes
+}
+
+func (err httpStatusError) Error() string {
+	return err.message
+}
+
+func (err httpStatusError) StatusCode() int {
+	return err.statusCode
+}
+
+func newHttpStatusError(message string, statusCode int) HTTPStatusError {
+	return httpStatusError{message: message, statusCode: statusCode}
+}
+
+func (p *pager) Next() bool {
+	if p.drive == nil {
+		return false
+	}
+
+	return p.lNodes == nil || p.lNodes.NextMarker != ""
+}
+
+func (p *pager) Nodes(ctx context.Context) ([]Node, error) {
+	err := p.drive.jsonRequest(ctx, "POST", apiList, &p.param, &p.lNodes)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	p.param["marker"] = p.lNodes.NextMarker
+	return p.lNodes.Items, nil
+}
+
 func (drive *Drive) String() string {
 	return fmt.Sprintf("AliyunDrive{driveId: %s}", drive.driveId)
+}
+
+// https://github.com/alist-org/alist/pull/3390
+// https://github.com/foxxorcat/alist/tree/fix_aliyundriver
+func (drive *Drive) sign() error {
+	if drive.deviceSessionPrivateKey == nil {
+		return errors.Errorf("failed to sign: deviceSessionPrivateKey is nil")
+	}
+
+	drive.nonce++
+	appId := "5dde4e1bdf9e4966b387ba58f4b3fdc3"
+	s := fmt.Sprintf("%s:%s:%s:%d", appId, drive.config.DeviceId, drive.userId, drive.nonce)
+	hash := sha256.Sum256([]byte(s))
+	data, err := ecc.SignBytes(drive.deviceSessionPrivateKey, hash[:], ecc.RecID|ecc.LowerS)
+	if err != nil {
+		return err
+	}
+
+	drive.signature = hex.EncodeToString(data)
+	return nil
 }
 
 func (drive *Drive) request(ctx context.Context, method, url string, headers map[string]string, body io.Reader) (*http.Response, error) {
@@ -150,6 +257,50 @@ func (drive *Drive) request(ctx context.Context, method, url string, headers map
 	return res, nil
 }
 
+func (drive *Drive) jsonRequestNoExpireCheck(ctx context.Context, method, url string, headers map[string]string, request interface{}, response interface{}) error {
+	if headers == nil {
+		headers = map[string]string{
+			"content-type":  "application/json;charset=UTF-8",
+			"authorization": "Bearer " + drive.accessToken,
+			"x-device-id":   drive.config.DeviceId,
+			"X-Signature":   drive.signature,
+		}
+	}
+
+	var bodyBytes []byte
+	if request != nil {
+		b, err := json.Marshal(request)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		bodyBytes = b
+	}
+
+	res, err := drive.request(ctx, method, url, headers, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer res.Body.Close()
+
+	b, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	if res.StatusCode >= 400 {
+		return newHttpStatusError(fmt.Sprintf(`failed to request "%s", got "%d", %s`, url, res.StatusCode, string(b)), res.StatusCode)
+	}
+
+	if response != nil {
+		err = json.Unmarshal(b, &response)
+		if err != nil {
+			return errors.Wrapf(err, `failed to parse response "%s"`, string(b))
+		}
+	}
+
+	return nil
+}
+
 func (drive *Drive) refreshToken(ctx context.Context) error {
 	headers := map[string]string{
 		"content-type": "application/json;charset=UTF-8",
@@ -158,28 +309,9 @@ func (drive *Drive) refreshToken(ctx context.Context) error {
 		"refresh_token": drive.config.RefreshToken,
 		"grant_type":    "refresh_token",
 	}
-
-	var body io.Reader
-	b, err := json.Marshal(&data)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	body = bytes.NewBuffer(b)
-	res, err := drive.request(ctx, "POST", apiRefreshToken, headers, body)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer res.Body.Close()
-
 	var token Token
-	b, err = ioutil.ReadAll(res.Body)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	err = json.Unmarshal(b, &token)
-	if err != nil {
-		return errors.Wrapf(err, `failed to parse response "%s"`, string(b))
+	if err := drive.jsonRequestNoExpireCheck(ctx, "POST", apiRefreshToken, headers, &data, &token); err != nil {
+		return err
 	}
 
 	drive.accessToken = token.AccessToken
@@ -199,56 +331,77 @@ func (drive *Drive) jsonRequest(ctx context.Context, method, url string, request
 			return errors.WithStack(err)
 		}
 	}
-	headers := map[string]string{
-		"content-type":  "application/json;charset=UTF-8",
-		"authorization": "Bearer " + drive.accessToken,
-	}
 
-	var bodyBytes []byte
-	if request != nil {
-		b, err := json.Marshal(request)
-		if err != nil {
-			return errors.WithStack(err)
+	if drive.deviceSessionExpireAt < time.Now().Unix() {
+		if err := drive.createDeviceSession(ctx); err != nil {
+			return err
 		}
-		bodyBytes = b
 	}
 
-	res, err := drive.request(ctx, method, url, headers, bytes.NewBuffer(bodyBytes))
+	return drive.jsonRequestNoExpireCheck(ctx, method, url, nil, request, response)
+}
+
+// https://github.com/alist-org/alist/issues/3375
+func (drive *Drive) createDeviceSession(ctx context.Context) error {
+	drive.deviceSessionMutex.Lock()
+	defer drive.deviceSessionMutex.Unlock()
+
+	key, err := ecdsa.GenerateKey(ecc.P256k1(), rand.Reader)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
-	defer res.Body.Close()
-
-	switch res.StatusCode {
-	case http.StatusNotFound:
-		return ErrorNotFound
-	case http.StatusTooManyRequests:
-		return ErrorTooManyRequests
-	default:
+	drive.deviceSessionPrivateKey = key
+	drive.nonce = -1
+	if err := drive.sign(); err != nil {
+		return err
 	}
 
-	if res.StatusCode >= 400 {
-		return errors.Errorf(`failed to request "%s", got "%d"`, url, res.StatusCode)
+	pubKey := key.PublicKey
+	b := elliptic.Marshal(pubKey.Curve, pubKey.X, pubKey.Y)
+	s := hex.EncodeToString(b)
+	data := map[string]interface{}{
+		"deviceName": "Chrome",
+		"modelName":  "Windows",
+		"pubKey":     s,
+	}
+	var result CreateDeviceSessionResult
+	err = drive.jsonRequestNoExpireCheck(ctx, "POST", apiCreateDeviceSession, nil, &data, &result)
+	if err != nil {
+		return err
 	}
 
-	if response != nil {
-		b, err := ioutil.ReadAll(res.Body)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		err = json.Unmarshal(b, &response)
-		if err != nil {
-			return errors.Wrapf(err, `failed to parse response "%s"`, string(b))
-		}
+	if !result.Success {
+		return errors.Errorf("failed to create device session")
 	}
 
+	drive.deviceSessionExpireAt = time.Now().Unix() + deviceSessionExpireSeconds
+	return nil
+}
+
+// TODO: fix renew_session device session signature error
+func (drive *Drive) renewDeviceSession(ctx context.Context) error {
+	drive.deviceSessionMutex.Lock()
+	defer drive.deviceSessionMutex.Unlock()
+
+	if err := drive.sign(); err != nil {
+		return err
+	}
+
+	var result CreateDeviceSessionResult
+	err := drive.jsonRequestNoExpireCheck(ctx, "POST", apiRenewDeviceSession, nil, map[string]string{}, &result)
+	if err != nil {
+		return err
+	}
+
+	if !result.Success {
+		return errors.Wrapf(err, "failed to renew device session")
+	}
+
+	drive.deviceSessionExpireAt = time.Now().Unix() + deviceSessionExpireSeconds
 	return nil
 }
 
 func NewFs(ctx context.Context, config *Config) (Fs, error) {
-	if config.UploadChunkSize <= 0 {
-		config.UploadChunkSize = DefaultPartSize
-	}
 	if config.UploadRetries <= 0 {
 		config.UploadRetries = DefaultUploadRetries
 	}
@@ -260,8 +413,27 @@ func NewFs(ctx context.Context, config *Config) (Fs, error) {
 		httpClient: config.HttpClient,
 	}
 
+	if drive.httpClient == nil {
+		drive.httpClient = &http.Client{}
+	}
+
 	// get driveId
-	driveId := ""
+	var user User
+	data := map[string]string{}
+	err := drive.jsonRequest(ctx, "POST", "https://api.aliyundrive.com/v2/user/get", &data, &user)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get driveId")
+	}
+
+	drive.driveId = user.DriveId
+	drive.userId = user.UserId
+	drive.rootId = "root"
+	drive.rootNode = Node{
+		NodeId: "root",
+		Type:   "folder",
+		Name:   "root",
+	}
+
 	if config.IsAlbum {
 		var albumInfo AlbumInfo
 		data := map[string]string{}
@@ -270,24 +442,7 @@ func NewFs(ctx context.Context, config *Config) (Fs, error) {
 			return nil, errors.Wrap(err, "failed to get driveId")
 		}
 
-		driveId = albumInfo.Data.DriveId
-	} else {
-		var user User
-		data := map[string]string{}
-		err := drive.jsonRequest(ctx, "POST", "https://api.aliyundrive.com/v2/user/get", &data, &user)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to get driveId")
-		}
-
-		driveId = user.DriveId
-	}
-
-	drive.driveId = driveId
-	drive.rootId = "root"
-	drive.rootNode = Node{
-		NodeId: "root",
-		Type:   "folder",
-		Name:   "root",
+		drive.driveId = albumInfo.Data.DriveId
 	}
 	drive.downloadUrlCache = make(map[string]DownloadUrlCacheItem)
 
@@ -307,34 +462,8 @@ func normalizePath(s string) string {
 	return s
 }
 
-func (drive *Drive) listNodes(ctx context.Context, nodeId string) ([]Node, error) {
-	data := map[string]interface{}{
-		"drive_id":       drive.driveId,
-		"parent_file_id": nodeId,
-		"limit":          200,
-		"marker":         "",
-	}
-	var nodes []Node
-	var lNodes *ListNodes
-	for {
-		if lNodes != nil && lNodes.NextMarker == "" {
-			break
-		}
-
-		err := drive.jsonRequest(ctx, "POST", apiList, &data, &lNodes)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		nodes = append(nodes, lNodes.Items...)
-		data["marker"] = lNodes.NextMarker
-	}
-
-	return nodes, nil
-}
-
 func (drive *Drive) findNameNode(ctx context.Context, nodeId string, name string, kind string) (*Node, error) {
-	nodes, err := drive.listNodes(ctx, nodeId)
+	nodes, err := drive.ListAll(ctx, nodeId)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -413,8 +542,29 @@ func (drive *Drive) About(ctx context.Context) (*PersonalSpaceInfo, error) {
 	return &result.PersonalSpaceInfo, nil
 }
 
-func (drive *Drive) List(ctx context.Context, nodeId string) ([]Node, error) {
-	return drive.listNodes(ctx, nodeId)
+func (drive *Drive) List(nodeId string) Pager {
+	param := map[string]interface{}{
+		"drive_id":       drive.driveId,
+		"parent_file_id": nodeId,
+		"limit":          200,
+		"marker":         "",
+	}
+	p := &pager{param: param, drive: drive}
+	return p
+}
+
+func (drive *Drive) ListAll(ctx context.Context, nodeId string) ([]Node, error) {
+	p := drive.List(nodeId)
+	var nodes []Node
+	for p.Next() {
+		data, err := p.Nodes(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		nodes = append(nodes, data...)
+	}
+	return nodes, nil
 }
 
 func createCheck(node Node) error {
@@ -538,6 +688,9 @@ func (drive *Drive) Open(ctx context.Context, nodeId string, headers map[string]
 	}
 
 	url := downloadUrl.Url
+	if drive.config.UseInternalUrl {
+		url = downloadUrl.InternalUrl
+	}
 	if url != "" {
 		res, err := drive.request(ctx, "GET", url, headers, nil)
 		if err != nil {
@@ -593,22 +746,31 @@ func CalcSha1(in *os.File) (*os.File, string, error) {
 	return in, fmt.Sprintf("%X", h.Sum(nil)), nil
 }
 
-func calcProof(accessToken string, fileSize int64, in *os.File) (*os.File, string, error) {
-	start := CalcProofOffset(accessToken, fileSize)
-	sret, _ := in.Seek(start, 0)
-	if sret != start {
-		_, _ = in.Seek(0, 0)
-		return in, "", errors.Errorf("failed to seek file to %d", start)
+func calcProof(accessToken string, fileSize int64, in io.ReaderAt) (string, error) {
+	// from https://github.com/alist-org/alist/blob/09564102e7ea4336ea6222e0381080a3a8273b21/drivers/aliyundrive/driver.go#L227
+	/*
+		var n = e.access_token，
+		r = new BigNumber('0x'.concat(md5(n).slice(0, 16)))，
+		i = new BigNumber(t.file.size)，
+		o = i ? r.mod(i) : new gt.BigNumber(0);
+		(t.file.slice(o.toNumber(), Math.min(o.plus(8).toNumber(), t.file.size)))
+	*/
+	h := md5.New()
+	h.Write([]byte(accessToken))
+	md5String := hex.EncodeToString(h.Sum(nil))[:16]
+	r, _ := new(big.Int).SetString(md5String, 16)
+	i := new(big.Int).SetInt64(fileSize)
+	o := new(big.Int).SetInt64(0)
+	if fileSize > 0 {
+		o = r.Mod(r, i)
 	}
-
 	buf := make([]byte, 8)
-	_, _ = in.Read(buf)
-	proofCode := base64.StdEncoding.EncodeToString(buf)
-	_, _ = in.Seek(0, 0)
-	return in, proofCode, nil
+	n, _ := io.NewSectionReader(in, o.Int64(), 8).Read(buf[:8])
+	proof := base64.StdEncoding.EncodeToString(buf[:n])
+	return proof, nil
 }
 
-func (drive *Drive) CalcProof(fileSize int64, in *os.File) (*os.File, string, error) {
+func (drive *Drive) CalcProof(fileSize int64, in *os.File) (string, error) {
 	return calcProof(drive.accessToken, fileSize, in)
 }
 
@@ -619,18 +781,18 @@ func (drive *Drive) CreateFile(ctx context.Context, node Node, in io.Reader) (st
 	fin, ok := in.(*os.File)
 	if ok {
 		in, sha1Code, _ = CalcSha1(fin)
-		in, proofCode, _ = drive.CalcProof(node.Size, fin)
+		proofCode, _ = drive.CalcProof(node.Size, fin)
 	}
 
 	return drive.CreateFileWithProof(ctx, node, in, sha1Code, proofCode)
 }
 
-func makePartInfoList(size int64, partSize int64) []*PartInfo {
+func makePartInfoList(size int64) []*PartInfo {
 	partInfoNum := 0
-	if size%partSize > 0 {
+	if size%MaxPartSize > 0 {
 		partInfoNum++
 	}
-	partInfoNum += int(size / partSize)
+	partInfoNum += int(size / MaxPartSize)
 	list := make([]*PartInfo, partInfoNum)
 	for i := 0; i < partInfoNum; i++ {
 		list[i] = &PartInfo{
@@ -787,7 +949,7 @@ func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Re
 
 	proof := &FileProof{
 		DriveID:         drive.driveId,
-		PartInfoList:    makePartInfoList(node.Size, drive.config.UploadChunkSize),
+		PartInfoList:    makePartInfoList(node.Size),
 		ParentFileID:    node.ParentId,
 		Name:            node.Name,
 		Type:            "file",
@@ -818,68 +980,22 @@ func (drive *Drive) CreateFileWithProof(ctx context.Context, node Node, in io.Re
 			return "", errors.New(`failed to extract uploadUrl`)
 		}
 	}
-	bufferSize := minInt64(drive.config.UploadChunkSize, node.Size)
-	if bufferSize == 0 {
-		bufferSize = drive.config.UploadChunkSize
-	}
-	uploadBuffer := make([]byte, bufferSize)
-	uploadedSize := 0
-	drive.config.LogFunc("begin to upload %v, with ctx %v\n", node.Name, ctx)
+
 	for _, part := range proofResult.PartInfoList {
-		partSize := drive.config.UploadChunkSize
-		if part.PartNumber == len(proofResult.PartInfoList) {
-			partSize = node.Size % drive.config.UploadChunkSize
+		partReader := io.LimitReader(in, MaxPartSize)
+		uploadUrl := part.UploadUrl
+		if drive.config.UseInternalUrl {
+			uploadUrl = part.InternalUploadURL
 		}
-		partReader := NewCachedLimitReaderWithBuffer(in, uploadBuffer, func(format string, a ...interface{}) {
-			f := fmt.Sprintf("%s %s", node.Name, format)
-			drive.config.LogFunc(f, a...)
-		})
-		tries := 0
-		for {
-			tries++
-			if partReader.err != nil {
-				return "", partReader.err
-			}
-			if !isUploadUrlValid(part.UploadUrl) {
-				drive.config.LogFunc("refreshing upload url for %d/%d %v, ", part.PartNumber, len(proofResult.PartInfoList), node.Name)
-				err := drive.refreshUploadUrl(ctx, proofResult.UploadId, proofResult.FileId, proofResult.PartInfoList)
-				if err != nil {
-					if tries < drive.config.UploadRetries && ctx.Err() == nil {
-						drive.config.LogFunc("refresh upload url failed %v, retry %d/%d, %v\n", part.UploadUrl, tries, drive.config.UploadRetries, err)
-						continue
-					} else {
-						return "", errors.Wrap(err, fmt.Sprintf("refresh upload url failed %v", err))
-					}
-				}
-				part = proofResult.PartInfoList[part.PartNumber-1]
-			}
-			partReader.r = 0
-			req, err := http.NewRequestWithContext(ctx, "PUT", part.UploadUrl, partReader)
-			if err != nil {
-				return "", errors.Wrap(err, "failed to create upload request")
-			}
-			resp, err := drive.httpClient.Do(req)
-			if err != nil {
-				if tries < drive.config.UploadRetries && ctx.Err() == nil {
-					drive.config.LogFunc("failed to upload file part %d/%d of %v, end at %d/%d/%d/%d, retries %d/%d, %v\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, partReader.r, drive.config.UploadChunkSize, uploadedSize+partReader.r, node.Size, tries, drive.config.UploadRetries, err)
-					continue
-				} else {
-					return "", errors.Wrap(err, "failed to upload file")
-				}
-			}
-			resp.Body.Close()
-			if partReader.r < int(partSize) {
-				drive.config.LogFunc("upload part %d/%d of %v, not complete %d %d, ctx err %v\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, partReader.r, partSize, ctx.Err())
-				return "", errors.Wrap(err, "failed to upload file read not complete")
-			}
-			uploadedSize += partReader.r
-			percent := 100
-			if node.Size > 0 {
-				percent = uploadedSize * 100 / int(node.Size)
-			}
-			drive.config.LogFunc("uploaded %d/%d of %v tries %d/%d size %d %d/%d %d percent\n", part.PartNumber, len(proofResult.PartInfoList), node.Name, tries, drive.config.UploadRetries, partReader.r, uploadedSize, node.Size, percent)
-			break
+		req, err := http.NewRequestWithContext(ctx, "PUT", uploadUrl, partReader)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to create upload request")
 		}
+		resp, err := drive.httpClient.Do(req)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to upload file")
+		}
+		resp.Body.Close()
 	}
 
 	var result NodeId
@@ -972,7 +1088,7 @@ func (drive *Drive) Update(ctx context.Context, node Node) (string, error) {
 	body := map[string]string{
 		"drive_id": drive.driveId,
 		"file_id":  node.NodeId,
-		//"check_name_mode": "refuse",
+		// "check_name_mode": "refuse",
 		"name": node.Name,
 		"meta": node.Meta,
 	}
@@ -982,4 +1098,113 @@ func (drive *Drive) Update(ctx context.Context, node Node) (string, error) {
 		return "", errors.Wrap(err, "failed to post update request")
 	}
 	return result.NodeId, nil
+}
+
+// create share link, para: ctx, file node list, pwd, expiresIn(second)
+// return shareID, pwd, expiration
+func (drive *Drive) CreateShareLink(ctx context.Context, node []Node, pwd string, expiresIn int64) (string, string, string, error) {
+	var NodeIDs []string
+	for _, node := range node {
+		NodeIDs = append(NodeIDs, node.NodeId)
+	}
+	expiration := time.Unix(time.Now().Unix()+expiresIn, 0).Format(time.RFC3339Nano)
+	expiration = expiration[0:19] + ".999Z"
+
+	body := map[string]interface{}{
+		"share_pwd":    pwd,
+		"drive_id":     drive.driveId,
+		"file_id_list": NodeIDs,
+		"expiration":   expiration,
+		// expiration: A RFC3339 style: 2022-07-02T15:04:05.923Z,
+	}
+	var result SharedFile
+	err := drive.jsonRequest(ctx, "POST", apiCreateShareLink, &body, &result)
+	if err != nil {
+		return "", "", "", errors.Wrap(err, "failed to post create share link request")
+	}
+	return result.ShareID, result.Pwd, result.Expiration, nil
+}
+
+// get share info by shareID
+// return value may vary
+func (drive *Drive) GetShareInfo(ctx context.Context, shareID string) (string, string, string, []string, error) {
+	body := map[string]string{
+		"share_id": shareID,
+	}
+	var result SharedFile
+	err := drive.jsonRequest(ctx, "POST", apiGetShareLinkByShareID, &body, &result)
+	if err != nil {
+		return "", "", "", []string{}, errors.Wrap(err, "failed to get share info by shareID")
+	}
+	return result.ShareID, result.Pwd, result.Expiration, result.FileIDList[:], nil
+}
+
+// get share_token using pwd and shareID
+// How to use share_token: https://help.aliyun.com/document_detail/397603.html
+func (drive *Drive) GetShareToken(ctx context.Context, pwd string, shareID string) (shareToken string, error error) {
+	body := make(map[string]string)
+	if pwd == "" {
+		body = map[string]string{
+			"share_id": shareID,
+		}
+	} else {
+		body = map[string]string{
+			"share_id":  shareID,
+			"share_pwd": pwd,
+		}
+	}
+	var result ShareToken
+	err := drive.jsonRequest(ctx, "POST", apiGetShareToken, &body, &result)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get share_token")
+	}
+	return result.shareToken, nil
+}
+
+// cancel shareLink by shareID
+func (drive *Drive) CancelShareLink(ctx context.Context, shareID string) error {
+	body := map[string]string{
+		"share_id": shareID,
+	}
+	err := drive.jsonRequest(ctx, "POST", apiCancelShareLink, &body, nil) // No need to parse json response, so nil
+	if err != nil {
+		return errors.Wrap(err, "failed to post cancel share link request")
+	}
+	return nil
+}
+
+func (drive *Drive) ListShareLinks(ctx context.Context) ([]SharedFile, string, error) {
+	body := map[string]interface{}{
+		"limit":             200,
+		"order_by":          "share_name",
+		"order_direction":   "ASC",
+		"include_cancelled": false,
+	}
+	var sharedFiles []SharedFile
+	var lSharedFiles *ListSharedFile
+	for {
+		if lSharedFiles != nil && lSharedFiles.NextMarker == "" {
+			break
+		}
+		err := drive.jsonRequest(ctx, "POST", apiListShareLink, &body, &lSharedFiles)
+		if err != nil {
+			return nil, "", errors.Wrap(err, "failed to get share links")
+		}
+		sharedFiles = append(sharedFiles, lSharedFiles.Items...)
+		body["marker"] = lSharedFiles.NextMarker
+	}
+
+	return sharedFiles, lSharedFiles.NextMarker, nil
+}
+
+func (drive *Drive) GetShareLinkByAnonymous(ctx context.Context, shareID string) (Expiration string, Creator string, err error) {
+	body := map[string]string{
+		"share_id": shareID,
+	}
+	var result SharedFile
+	errs := drive.jsonRequest(ctx, "POST", apiGetShareLinkByAnonymous, &body, &result)
+	if errs != nil {
+		return "", "", errors.Wrap(err, "failed to get share link by shareID")
+	}
+	return result.Expiration, result.Creator, nil
 }
